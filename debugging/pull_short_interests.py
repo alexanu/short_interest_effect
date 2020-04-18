@@ -59,51 +59,20 @@ def pull_short_interests(exchange, host, info_table_path, short_interests_table_
         if LIMIT is not None:
             df = df.limit(LIMIT)
     symbols = df.select('Symbol').rdd.map(lambda r: r['Symbol']).collect()
-    
-    table_exists = spark_table_exists(host, short_interests_table_path)
-
-    last_dates = None
-    if table_exists:
-        short_sdf = spark.read.csv(host+short_interests_table_path, header=True)
-        last_dates = short_sdf.groupBy('Symbol').agg(F.max('Date').alias('last_date')).collect()
-        last_dates = rowlist2dict(last_dates)
-        
+            
     total_rows = 0
     data_to_write = []
     for i, symbol in enumerate(symbols):
         data = []
-        if table_exists:
-            # Get the last date of a stock. If this last date >= PULL_DATE, don't do anything.
-            if last_dates != None:
-                if symbol in last_dates:
-                    date = last_dates[symbol]
-                    if a_before_b(date, PULL_DATE):
-                        data = pull_exchange_short_interests_by_symbol(symbol, date, PULL_DATE)
-                        if len(data)==0:
-                            logger.warn("{}: last date in db ({}) is before pull date ({}) and data exist. Hold the data in memory for storing to db.".format(symbol, date, PULL_DATE))
-                        else:
-                            logger.warn("{}: last date in db ({}) is before pull date ({}) but no data newer than last date is available in Quandl.".format(symbol, date, PULL_DATE))
-                    else:
-                        logger.warn("{}: last date in db ({}) is after pull date ({}), so do nothing.".format(symbol, date, PULL_DATE))
-                else:
-                    logger.warn("{}: pull data from all dates".format(symbol))
-                    data = pull_exchange_short_interests_by_symbol(symbol, START_DATE, PULL_DATE)
-            else:
-                logger.warn("{}: pull data from all dates".format(symbol))
-                data = pull_exchange_short_interests_by_symbol(symbol, START_DATE, PULL_DATE)
-        else:
-            data = pull_exchange_short_interests_by_symbol(symbol, START_DATE, PULL_DATE)
+        data = pull_exchange_short_interests_by_symbol(symbol, '2020-02-19', YESTERDAY_DATE)
+        logger.warn(data)
         
         if len(data) > 0:
             data_to_write += data
 
         total_rows += len(data)
         if (i%log_every_n == 0 or (i+1) == len(symbols)):
-            logger.warn("storing data downloaded from exchange {} - {}/{} - total rows in this batch: {}".format(exchange, i+1, len(symbols), total_rows))
             if len(data_to_write) > 0:
-                sdf_to_write = spark.createDataFrame(data_to_write)
-                sdf_to_write.write.mode('append').format('csv').save(host+short_interests_table_path, header=True)
-                logger.warn("Written {} rows to {}".format(len(data_to_write), host+short_interests_table_path))
                 data_to_write = []
 
 

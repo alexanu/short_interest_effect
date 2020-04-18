@@ -4,33 +4,26 @@ This DAG deals with cluster creation and then wait for the other DAGs to complet
 before terminating all created objects, including EMR cluster, key pairs,
 and security groups.
 """
-import os
 from datetime import timedelta
 from airflow import DAG
 from airflow.operators.python_operator import PythonOperator
 from airflow.operators.custom_operators import VariableExistenceSensor
 from airflow.models import Variable
 import lib.emrspark_lib as emrs
-import configparser
 import time
+from airflow.configuration import conf as airflow_config
 
 import logging
 import os
 
 from airflow.utils import timezone
-yesterday = timezone.utcnow() - timedelta(days=2)
+start_date = timezone.utcnow() - timedelta(days=2)
 
-config = configparser.ConfigParser()
-config.read('airflow/config.cfg')
-
-CLUSTER_NAME = config['AWS']['CLUSTER_NAME']
-VPC_ID = config['AWS']['VPC_ID']
-SUBNET_ID = config['AWS']['SUBNET_ID']
-
+from lib.common import *
 
 default_args = {
     'owner': 'jaycode',
-    'start_date': yesterday,
+    'start_date': start_date,
     'depends_on_past': True,
     'retries': 0,
     'email_on_retry': False,
@@ -49,23 +42,24 @@ dag = DAG('cluster_dag',
 )
 
 
-ec2, emr, iam = emrs.get_boto_clients(config['AWS']['REGION_NAME'], config=config)
-
-if VPC_ID == '':
-    VPC_ID = emrs.get_first_available_vpc(ec2)
-
-if SUBNET_ID == '':
-    SUBNET_ID = emrs.get_first_available_subnet(ec2, VPC_ID)
-
 
 def preparation(**kwargs):
+    # Without this global setting, this DAG on EC2 server got the following error:
+    #     UnboundLocalError: local variable 'VPC_ID' referenced before assignment
+    global VPC_ID, SUBNET_ID, CLUSTER_NAME
     Variable.delete('cluster_id')
     Variable.delete('keypair_name')
     Variable.delete('master_sg_id')
     Variable.delete('slave_sg_id')
     Variable.delete('short_interests_dag_state')
-    Variable.delete('prices_dag_state')
-    Variable.delete('combine_dag_state')
+
+    ec2, emr, iam = emrs.get_boto_clients(config['AWS']['REGION_NAME'], config=config)
+
+    if VPC_ID == '':
+        VPC_ID = emrs.get_first_available_vpc(ec2)
+
+    if SUBNET_ID == '':
+        SUBNET_ID = emrs.get_first_available_subnet(ec2, VPC_ID)
 
     master_sg_id = emrs.create_security_group(ec2, '{}SG'.format(CLUSTER_NAME),
         'Master SG for {}'.format(CLUSTER_NAME), VPC_ID)
@@ -75,27 +69,37 @@ def preparation(**kwargs):
     Variable.set('master_sg_id', master_sg_id)
     Variable.set('slave_sg_id', slave_sg_id)
 
-    keypair = emrs.recreate_key_pair(ec2, '{}_pem'.format(CLUSTER_NAME))
+    keypair = emrs.create_key_pair(ec2, '{}_pem'.format(CLUSTER_NAME))
     Variable.set('keypair_name', keypair['KeyName'])
 
-    emrs.recreate_default_roles(iam)
+    emrs.create_default_roles(iam)
 
 
 def create_cluster(**kwargs):
+    logging.info("instance type is "+config['AWS']['EMR_CORE_NODE_INSTANCE_TYPE'])
+    ec2, emr, iam = emrs.get_boto_clients(config['AWS']['REGION_NAME'], config=config)
+    emrs.wait_for_roles(iam)
     cluster_id = emrs.create_emr_cluster(emr, CLUSTER_NAME,
         Variable.get('master_sg_id'),
         Variable.get('slave_sg_id'),
-        Variable.get('keypair_name'), SUBNET_ID)
-        # release_label='emr-5.28.1')
+        Variable.get('keypair_name'),
+        SUBNET_ID,
+        num_core_nodes=int(config['AWS']['EMR_NUM_CORE_NODES']),
+        core_node_instance_type=config['AWS']['EMR_CORE_NODE_INSTANCE_TYPE'],
+        release_label='emr-5.28.1'
+    )
     Variable.set('cluster_id', cluster_id)
 
 
 def terminate_cluster(**kwargs):
-    if Variable.get('combine_dag_state') == '':
+    keep_cluster = Variable.get('keep_emr_cluster', default_var=False)
+    if not keep_cluster:
+        ec2, emr, iam = emrs.get_boto_clients(config['AWS']['REGION_NAME'], config=config)
         emrs.delete_cluster(emr, Variable.get('cluster_id'))
 
 
 def cleanup(**kwargs):
+    ec2, emr, iam = emrs.get_boto_clients(config['AWS']['REGION_NAME'], config=config)
     ec2.delete_key_pair(KeyName=Variable.get('keypair_name'))
     emrs.delete_security_group(ec2, Variable.get('master_sg_id'))
     time.sleep(2)
@@ -105,8 +109,6 @@ def cleanup(**kwargs):
     Variable.delete('master_sg_id')
     Variable.delete('slave_sg_id')
     Variable.delete('short_interests_dag_state')
-    Variable.delete('prices_dag_state')
-    Variable.delete('combine_dag_state')
 
 
 preparation_task = PythonOperator(
@@ -124,7 +126,7 @@ create_cluster_task = PythonOperator(
 check_etl_completion_task = VariableExistenceSensor(
     task_id='Check_etl_completion',
     poke_interval=120,
-    varnames=['combine_dag_state'],
+    varnames=['short_interests_dag_state'],
     mode='reschedule',
     dag=dag
 )
